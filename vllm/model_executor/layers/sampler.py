@@ -108,13 +108,18 @@ class Sampler(nn.Module):
             on_device_tensors = None
 
         # Get the logprobs query results.
-        prompt_logprobs, sample_logprobs = _get_logprobs(
+        # prompt_logprobs, sample_logprobs = _get_logprobs(
+        #     logprobs, sampling_metadata, sample_results)
+        # return _build_sampler_output(sample_results,
+        #                              sampling_metadata,
+        #                              prompt_logprobs,
+        #                              sample_logprobs,
+        #                              on_device_tensors=on_device_tensors)
+
+        selected_logprobs, ranks, top_token_ids, top_logprobs, largest_num_logprobs = _get_logprobs(
             logprobs, sampling_metadata, sample_results)
-        return _build_sampler_output(sample_results,
-                                     sampling_metadata,
-                                     prompt_logprobs,
-                                     sample_logprobs,
-                                     on_device_tensors=on_device_tensors)
+        return sample_results, selected_logprobs, ranks, top_token_ids, top_logprobs, largest_num_logprobs, on_device_tensors
+
 
     @property
     def _should_modify_greedy_probs_inplace(self) -> bool:
@@ -284,7 +289,7 @@ def _greedy_sample(
         same as the length of selected_seq_groups. If the corresponding
         seq_group has do_sample=False, tuple contains ([], [])
     """
-    samples = samples.tolist()
+    #samples = samples.tolist()
     sample_idx = 0
     results: SampleResultType = []
     for seq_group in selected_seq_groups:
@@ -716,7 +721,8 @@ def _get_logprobs(
     """
     # The index of query token to calculate logprobs. It includes both
     # prompt and sample logprob indices.
-    query_indices: List[int] = []
+    query_indices = torch.empty((len(sample_results)), dtype=torch.int, device=logprobs.device) #: List[int] = []
+    #query_indices: List[int] = []
     # The next token ids to get the logprob value from.
     next_token_ids: List[int] = []
     # The largest requested number of logprobs. We find logprobs as many as the
@@ -725,8 +731,8 @@ def _get_logprobs(
 
     # Select indices to compute logprob from, ranks of token ids, and the top
     # k token ids from logprobs.
-    for (seq_group, sample_result) in zip(sampling_metadata.seq_groups,
-                                          sample_results):
+    for i, (seq_group, sample_result) in enumerate(zip(sampling_metadata.seq_groups,
+                                          sample_results)):
         sampling_params = seq_group.sampling_params
 
         # Update indices and tokens for prompt logprobs.
@@ -737,6 +743,7 @@ def _get_logprobs(
             next_prompt_tokens = _get_next_prompt_tokens(seq_group)
             query_indices.extend(seq_group.prompt_logprob_indices)
             next_token_ids.extend(next_prompt_tokens)
+            assert False
 
         # Update indices and next tokenes for sample logprob.
         if seq_group.do_sample:
@@ -746,23 +753,26 @@ def _get_logprobs(
             # The current step may have different number of seq_ids, and
             # we can obtain it from `sample_result[1]`.
             query_idx = seq_group.sample_indices[0]
-            query_indices.extend(
-                [query_idx + parent_id for parent_id in parent_seq_ids])
+            # query_indices.extend(
+            #     [query_idx + parent_id for parent_id in parent_seq_ids])
+            query_indices[i] = [query_idx + parent_id for parent_id in parent_seq_ids][0]
             next_token_ids.extend(token_ids)
 
             if sampling_params.logprobs is not None:
                 largest_num_logprobs = max(largest_num_logprobs,
                                            sampling_params.logprobs)
 
-        assert len(next_token_ids) == len(query_indices)
+    assert len(next_token_ids) == len(query_indices)
 
     if len(query_indices) == 0:
         empty_sampled_logprob: SampleLogprobs = []
         empty_prompt_logprob: Optional[PromptLogprobs] = None
         return [empty_prompt_logprob], [empty_sampled_logprob]
 
-    query_indices_gpu = torch.tensor(query_indices, device=logprobs.device)
-    next_token_ids_gpu = torch.tensor(next_token_ids, device=logprobs.device)
+    #query_indices_gpu = torch.tensor(query_indices, device=logprobs.device)
+    query_indices_gpu = query_indices
+    #next_token_ids_gpu = torch.tensor(next_token_ids, device=logprobs.device)
+    next_token_ids_gpu = torch.stack(next_token_ids)
 
     # (num_selected_query_tokens, num_logprobs). Note that query_indices can
     # contain duplicates if beam search is enabled.
@@ -779,16 +789,48 @@ def _get_logprobs(
     # Logprobs of topk tokens for a batch of sequence groups.
     # (num_query_tokens_across_batch).
     if largest_num_logprobs > 0:
-        top_logprobs, top_token_ids = torch.topk(logprobs,
-                                                 largest_num_logprobs,
-                                                 dim=-1)
-        top_logprobs = top_logprobs.cpu()
-        top_token_ids = top_token_ids.cpu()
+        if largest_num_logprobs == 1:
+            top_logprobs, top_token_ids = torch.max(logprobs,
+                                                    dim=-1)
+            top_logprobs = top_logprobs.unsqueeze(-1)
+            top_token_ids = top_token_ids.unsqueeze(-1)
+        else:
+            top_logprobs, top_token_ids = torch.topk(logprobs,
+                                                    largest_num_logprobs,
+                                                    dim=-1)
     else:
         top_logprobs, top_token_ids = None, None
 
+    return selected_logprobs, ranks, top_token_ids, top_logprobs, largest_num_logprobs
+
+def _get_logprobs_CPU(
+    selected_logprobs: torch.Tensor,
+    ranks: torch.Tensor,
+    top_token_ids: torch.Tensor,
+    top_logprobs: torch.Tensor,
+    largest_num_logprobs,
+    sampling_metadata: SamplingMetadata,
+    sample_results: SampleResultType,
+    on_device_tensors,
+) -> Tuple[List[Optional[PromptLogprobs]], List[SampleLogprobs]]:
+    # CPU post-processing
+    if largest_num_logprobs > 0:
+        top_logprobs = top_logprobs.cpu()
+        top_token_ids = top_token_ids.cpu()
+
     selected_logprobs = selected_logprobs.cpu()
     ranks = ranks.cpu()
+    sample_results_cpu = []
+    for sample_result in sample_results:
+        next_token_ids, parent_ids = sample_result
+        next_token_ids_cpu = []
+        parent_ids_cpu = []
+        for next_token_id in next_token_ids:
+            next_token_ids_cpu.append(next_token_id.item() if torch.is_tensor(next_token_id) else next_token_id)
+        for parent_id in parent_ids:
+            parent_ids_cpu.append(parent_id.item() if torch.is_tensor(parent_id) else parent_id)
+        sample_results_cpu.append((next_token_ids_cpu, parent_ids_cpu))
+    sample_results = sample_results_cpu
 
     # Find prompt/sample logprobs.
     prompt_logprobs_per_seq_group: List[Optional[PromptLogprobs]] = []
@@ -810,8 +852,11 @@ def _get_logprobs(
              top_logprobs, selected_logprobs_idx, top_logprob_idx)
         sample_logprobs_per_seq_group.append(sampled_logprobs)
 
-    return prompt_logprobs_per_seq_group, sample_logprobs_per_seq_group
-
+    return _build_sampler_output(sample_results,
+        sampling_metadata,
+        prompt_logprobs_per_seq_group,
+        sample_logprobs_per_seq_group,
+        on_device_tensors=on_device_tensors)
 
 def _get_prompt_logprob_if_needed(
     seq_group: SequenceGroupToSample,
@@ -997,6 +1042,7 @@ def _build_sampler_output(
         for parent_id, next_token_id, logprobs in zip(parent_ids,
                                                       next_token_ids,
                                                       group_sample_logprobs):
+            assert torch.is_tensor(next_token_id) == False
             seq_outputs.append(
                 SequenceOutput(seq_ids[parent_id], next_token_id, logprobs))
         sampler_output.append(

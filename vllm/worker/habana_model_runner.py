@@ -110,6 +110,7 @@ def align_workers(value, op):
 class HpuModelAdapter():
     def __init__(self, model):
         self.model = model
+        self.model.sampler.include_gpu_probs_tensor = True
 
     def _set_attn_bias(self, attn_metadata, batch_size, seq_len, device, dtype):
         prefill_metadata = attn_metadata.prefill_metadata
@@ -559,7 +560,7 @@ class HabanaModelRunner:
                 generation_token = seq_data.get_last_token_id()
                 input_tokens.append([generation_token])
 
-                seq_len = seq_data.get_len()
+                seq_len = seq_data.get_num_computed_tokens() + 1
                 position = seq_len - 1
                 input_positions.append([position])
 
@@ -816,6 +817,9 @@ class HabanaModelRunner:
         seq_group_metadata_list: Optional[List[SequenceGroupMetadata]],
         kv_caches: List[torch.Tensor],
     ) -> Optional[SamplerOutput]:
+        # print(f" ==> execute model")
+        n_minus_1_mode = os.environ.get('VLLM_N_MINUS_1_WORKER', 'false').lower() == 'true'
+
         if self.is_driver_worker:
             event_start = self.profiler.get_timestamp_us()
             is_prompt = seq_group_metadata_list[0].is_prompt
@@ -849,6 +853,82 @@ class HabanaModelRunner:
         if self.vision_language_config:
             execute_model_kwargs.update({"image_input": multi_modal_input})
 
+        class SamplerIntermediateOutput:
+            def __init__(self, sampling_metadata, sample_results, selected_logprobs, ranks, top_token_ids, top_logprobs, largest_num_logprobs, real_batch_size):
+                self.sampling_metadata = sampling_metadata
+                self.sample_results = sample_results
+                self.selected_logprobs = selected_logprobs
+                self.ranks = ranks
+                self.top_token_ids = top_token_ids
+                self.top_logprobs = top_logprobs
+                self.largest_num_logprobs = largest_num_logprobs
+                self.real_batch_size = real_batch_size
+
+        htorch.core.mark_step()
+        # Sample the next token based on previous logits if any.
+        if n_minus_1_mode and not is_prompt:
+            prev_logits_list = []
+            for seq_group_metadata in seq_group_metadata_list:
+                assert len(seq_group_metadata.seq_data) == 1
+                for seq_data in seq_group_metadata.seq_data.values():
+                    if seq_data.prev_logits is not None:
+                        prev_logits_list.append(seq_data.prev_logits)
+                    else:
+                        # warmup only, TODO add a check
+                        prev_logits_list.append(torch.zeros([32000], dtype=torch.float, device="hpu"))
+
+            assert len(prev_logits_list) == len(seq_group_metadata_list)
+            prev_logits = torch.stack(prev_logits_list, dim=0)
+
+            # class SamplerIntermediateOutput:
+            #     def __init__(self, sampling_metadata, sample_results, selected_logprobs, ranks, top_token_ids, top_logprobs, largest_num_logprobs, real_batch_size):
+            #         self.sampling_metadata = sampling_metadata
+            #         self.sample_results = sample_results
+            #         self.selected_logprobs = selected_logprobs
+            #         self.ranks = ranks
+            #         self.top_token_ids = top_token_ids
+            #         self.top_logprobs = top_logprobs
+            #         self.largest_num_logprobs = largest_num_logprobs
+            #         self.real_batch_size = real_batch_size
+
+            with self.profiler.record_event('internal', f'sample_{"prompt" if is_prompt else "decode"}_bs{batch_size}_seq{seq_len}'):
+                sample_results, selected_logprobs, ranks, top_token_ids, top_logprobs, largest_num_logprobs, on_device_tensors = self.model.sample(
+                    logits=prev_logits,
+                    sampling_metadata=sampling_metadata,
+                )
+                (sampled_token_probs, logprobs_tensor, sampled_token_ids) = on_device_tensors
+                prev_sample_output = SamplerIntermediateOutput(sampling_metadata, sample_results, selected_logprobs, ranks, top_token_ids, top_logprobs, largest_num_logprobs, real_batch_size)
+                # print(f"sampled_token_ids {sampled_token_ids.data}")
+                # print(f"sample_results {sample_results}")
+
+            # print(f"decode output = {output}")
+            # print(f"decode output.sampled_token_ids = {output.sampled_token_ids.data}")
+
+            # In look-ahead scenario we need to feed the on-device token_ids from previous step instead
+            # print(f"filling prev_token_ids")
+            # prev_token_ids = {}
+            # for seq_group_metadata, token_id in zip(seq_group_metadata_list, torch.unbind(sampled_token_ids, dim=0)):
+            #     for seq_id in seq_group_metadata.seq_data.keys():
+            #         prev_token_ids[seq_id] = token_id
+
+            # prev_input_tokens = []
+            # seq_ids = [meta.request_id for meta in seq_group_metadata_list[:real_batch_size]]
+            # for seq_id in seq_ids:
+            #     seq_id = int(seq_id)
+            #     assert seq_id in prev_token_ids
+            #     prev_input_tokens.append(prev_token_ids[seq_id])
+
+            # prev_input_tokens = torch.stack(prev_input_tokens)
+            # assert prev_input_tokens.numel() == real_batch_size
+            # prev_input_tokens = torch.nn.functional.pad(prev_input_tokens, (0, input_tokens.numel() - prev_input_tokens.numel()), mode='constant', value=0)
+            # assert input_tokens.numel() == prev_input_tokens.numel(), f"{input_tokens.numel()} == {prev_input_tokens.numel()}"
+
+            # execute_model_kwargs["input_ids"] = prev_input_tokens.reshape(input_tokens.shape)
+            # print(f"execute_model_kwargs['input_ids'] {execute_model_kwargs['input_ids']}")
+            execute_model_kwargs["input_ids"] = sampled_token_ids
+
+        # print(f"execute_model_kwargs['input_ids'] {execute_model_kwargs['input_ids']}")
+        # print(f"execute_model_kwargs['positions'] {execute_model_kwargs['positions']}")
         htorch.core.mark_step()
         if self.is_driver_worker:
             model_event_name = f"model_{'prompt' if is_prompt else 'decode'}_bs{batch_size}_seq{seq_len}_graphs{'T' if use_graphs else 'F'}"
@@ -857,10 +937,51 @@ class HabanaModelRunner:
         with self.profiler.record_event('internal', model_event_name):
             hidden_states = self.model.forward(**execute_model_kwargs, selected_token_indices=sampling_metadata.selected_token_indices, bypass_hpu_graphs=not use_graphs)
 
+        htorch.core.mark_step()
+        if n_minus_1_mode:
+            if not is_prompt:
+                from vllm.model_executor.layers.sampler import _get_logprobs_CPU
+                prev = prev_sample_output
+                output = _get_logprobs_CPU(prev.selected_logprobs, prev.ranks, prev.top_token_ids, prev.top_logprobs, prev.largest_num_logprobs, prev.sampling_metadata, prev.sample_results, None)
+            else:
+                # For prompts compose empty output
+                from vllm.sequence import (Logprob, PromptLogprobs, SampleLogprobs, SamplerOutput, SequenceGroupOutput, SequenceOutput)
+                sampler_output = []
+                for seq_group in sampling_metadata.seq_groups:
+                    seq_ids = seq_group.seq_ids
+                    next_token_ids, parent_ids = [-1], [0]
+                    seq_outputs = []
+                    for parent_id, next_token_id in zip(parent_ids,
+                                                        next_token_ids):
+                        seq_outputs.append(
+                            SequenceOutput(seq_ids[parent_id], next_token_id, {-1: Logprob(0.0)}))
+                    sampler_output.append(
+                        SequenceGroupOutput(seq_outputs, None))
+
+                sampled_token_probs, logprobs_tensor, sampled_token_ids = (None, None, None)
+                output = SamplerOutput(
+                    outputs=sampler_output,
+                    sampled_token_probs=sampled_token_probs,
+                    sampled_token_ids=sampled_token_ids,
+                    logprobs=logprobs_tensor,
+                )
+                # print(f"prompt output = {output}")
+
+            output.outputs = output.outputs[:real_batch_size]
+
         # Compute the logits.
+        htorch.core.mark_step()
         with self.profiler.record_event('internal', f'compute_logits_{"prompt" if is_prompt else "decode"}_bs{batch_size}_seq{seq_len}'):
             sampling_metadata.selected_token_indices = None
             logits = self.model.compute_logits(hidden_states, sampling_metadata)
+
+        logits_list = torch.unbind(logits, dim=0)
+        for seq_logits, seq_group_metadata in zip(logits_list, seq_group_metadata_list):
+            assert len(seq_group_metadata.seq_data) == 1
+            for seq_data in seq_group_metadata.seq_data.values():
+                # print(f"seq_data.prev_logits {seq_data.prev_logits}")
+                seq_data.prev_logits = seq_logits
+
         htorch.core.mark_step()
 
         # Only perform sampling in the driver worker.
@@ -868,12 +989,26 @@ class HabanaModelRunner:
             return None
 
         # Sample the next token.
-        with self.profiler.record_event('internal', f'sample_{"prompt" if is_prompt else "decode"}_bs{batch_size}_seq{seq_len}'):
-            output = self.model.sample(
-                logits=logits,
-                sampling_metadata=sampling_metadata,
-            )
-        output.outputs = output.outputs[:real_batch_size]
+        # with self.profiler.record_event('internal', f'sample_{"prompt" if is_prompt else "decode"}_bs{batch_size}_seq{seq_len}'):
+        #     output = self.model.sample(
+        #         logits=logits,
+        #         sampling_metadata=sampling_metadata,
+        #     )
+        # output.outputs = output.outputs[:real_batch_size]
+        # htorch.core.mark_step()
+        # print(f"ref output = {output}")
+
+        # Sample the next token.
+        if not n_minus_1_mode:
+            with self.profiler.record_event('internal', f'sample_{"prompt" if is_prompt else "decode"}_bs{batch_size}_seq{seq_len}'):
+                sample_results, selected_logprobs, ranks, top_token_ids, top_logprobs, largest_num_logprobs, on_device_tensors = self.model.sample(
+                    logits=logits,
+                    sampling_metadata=sampling_metadata,
+                )
+                sample_output = SamplerIntermediateOutput(sampling_metadata, sample_results, selected_logprobs, ranks, top_token_ids, top_logprobs, largest_num_logprobs, real_batch_size)
+                from vllm.model_executor.layers.sampler import _get_logprobs_CPU
+                output = _get_logprobs_CPU(sample_output.selected_logprobs, sample_output.ranks, sample_output.top_token_ids, sample_output.top_logprobs, sample_output.largest_num_logprobs, sample_output.sampling_metadata, sample_output.sample_results, None)
+            output.outputs = output.outputs[:real_batch_size]
         htorch.core.mark_step()
 
         if self.is_driver_worker:

@@ -101,6 +101,7 @@ class SingleStepOutputProcessor(SequenceGroupOutputProcessor):
             for child_sample in child_samples[:-1]:
                 new_child_seq_id: int = next(self.seq_counter)
                 child = parent.fork(new_child_seq_id)
+                assert False
                 child.append_token_id(child_sample.output_token,
                                       child_sample.logprobs)
                 child_seqs.append((child, parent))
@@ -108,9 +109,10 @@ class SingleStepOutputProcessor(SequenceGroupOutputProcessor):
             # We reuse the parent sequence here to reduce redundant memory
             # copies, especially when using non-beam search sampling methods.
             last_child_sample = child_samples[-1]
-            parent.append_token_id(last_child_sample.output_token,
-                                   last_child_sample.logprobs)
-            child_seqs.append((parent, parent))
+            if last_child_sample.output_token != -1:
+                parent.append_token_id(last_child_sample.output_token,
+                                    last_child_sample.logprobs)
+                child_seqs.append((parent, parent))
 
         for seq, _ in child_seqs:
             if seq_group.sampling_params.detokenize and self.detokenizer:

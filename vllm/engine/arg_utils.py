@@ -39,7 +39,7 @@ class EngineArgs:
     max_parallel_loading_workers: Optional[int] = None
     block_size: int = 16
     enable_prefix_caching: bool = False
-    use_v2_block_manager: bool = False
+    use_v2_block_manager: bool = True
     swap_space: int = 4  # GiB
     gpu_memory_utilization: float = 0.90
     max_num_batched_tokens: Optional[int] = None
@@ -67,7 +67,7 @@ class EngineArgs:
     device: str = 'auto'
     ray_workers_use_nsight: bool = False
     num_gpu_blocks_override: Optional[int] = None
-    num_lookahead_slots: int = 0
+    num_lookahead_slots: int = 1
     model_loader_extra_config: Optional[dict] = None
 
     # Related to Vision-language models such as llava
