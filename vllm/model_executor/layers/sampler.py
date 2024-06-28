@@ -116,8 +116,15 @@ class Sampler(nn.Module):
         #                              sample_logprobs,
         #                              on_device_tensors=on_device_tensors)
 
-        selected_logprobs, ranks, top_token_ids, top_logprobs, largest_num_logprobs = _get_logprobs(
-            logprobs, sampling_metadata, sample_results)
+        # selected_logprobs, ranks, top_token_ids, top_logprobs, largest_num_logprobs = _get_logprobs(
+        #     logprobs, sampling_metadata, sample_results)
+
+        ranks = torch.full((logprobs.size(0),), 1, dtype=torch.int, device="hpu")
+        selected_logprobs = torch.full((logprobs.size(0),), 0.0, device="hpu")
+        top_token_ids = maybe_sampled_tokens_tensor
+        top_logprobs = torch.unsqueeze(selected_logprobs, dim=0)
+        largest_num_logprobs = 1
+
         return sample_results, selected_logprobs, ranks, top_token_ids, top_logprobs, largest_num_logprobs, on_device_tensors
 
 
@@ -815,22 +822,25 @@ def _get_logprobs_CPU(
 ) -> Tuple[List[Optional[PromptLogprobs]], List[SampleLogprobs]]:
     # CPU post-processing
     if largest_num_logprobs > 0:
-        top_logprobs = top_logprobs.cpu()
+        #top_logprobs = top_logprobs.cpu()
         top_token_ids = top_token_ids.cpu()
 
-    selected_logprobs = selected_logprobs.cpu()
-    ranks = ranks.cpu()
-    sample_results_cpu = []
-    for sample_result in sample_results:
-        next_token_ids, parent_ids = sample_result
-        next_token_ids_cpu = []
-        parent_ids_cpu = []
-        for next_token_id in next_token_ids:
-            next_token_ids_cpu.append(next_token_id.item() if torch.is_tensor(next_token_id) else next_token_id)
-        for parent_id in parent_ids:
-            parent_ids_cpu.append(parent_id.item() if torch.is_tensor(parent_id) else parent_id)
-        sample_results_cpu.append((next_token_ids_cpu, parent_ids_cpu))
-    sample_results = sample_results_cpu
+    #selected_logprobs = selected_logprobs.cpu()
+    #ranks = ranks.cpu()
+    #print(f"sample_results {sample_results}")
+    #print(f"top_token_ids {top_token_ids}")
+    # sample_results_cpu = []
+    # for sample_result in sample_results:
+    #     next_token_ids, parent_ids = sample_result
+    #     next_token_ids_cpu = []
+    #     parent_ids_cpu = []
+    #     for next_token_id in next_token_ids:
+    #         next_token_ids_cpu.append(next_token_id.item() if torch.is_tensor(next_token_id) else next_token_id)
+    #     for parent_id in parent_ids:
+    #         parent_ids_cpu.append(parent_id.item() if torch.is_tensor(parent_id) else parent_id)
+    #     sample_results_cpu.append((next_token_ids_cpu, parent_ids_cpu))
+    # sample_results = sample_results_cpu
+    # print(f"sample_results_cpu {sample_results_cpu}")
 
     # Find prompt/sample logprobs.
     prompt_logprobs_per_seq_group: List[Optional[PromptLogprobs]] = []
@@ -840,23 +850,27 @@ def _get_logprobs_CPU(
 
     for seq_group, sample_result in zip(sampling_metadata.seq_groups,
                                         sample_results):
-        (prompt_logprobs, top_logprob_idx,
-         selected_logprobs_idx) = _get_prompt_logprob_if_needed(
-             seq_group, selected_logprobs, ranks, top_token_ids, top_logprobs,
-             selected_logprobs_idx, top_logprob_idx)
-        prompt_logprobs_per_seq_group.append(prompt_logprobs)
+        # (prompt_logprobs, top_logprob_idx,
+        #  selected_logprobs_idx) = _get_prompt_logprob_if_needed(
+        #      seq_group, selected_logprobs, ranks, top_token_ids, top_logprobs,
+        #      selected_logprobs_idx, top_logprob_idx)
+        # prompt_logprobs_per_seq_group.append(prompt_logprobs)
+        prompt_logprobs_per_seq_group.append(None)
 
-        (sampled_logprobs, top_logprob_idx,
-         selected_logprobs_idx) = _get_sampled_logprob_if_needed(
-             seq_group, sample_result, selected_logprobs, ranks, top_token_ids,
-             top_logprobs, selected_logprobs_idx, top_logprob_idx)
-        sample_logprobs_per_seq_group.append(sampled_logprobs)
+        # (sampled_logprobs, top_logprob_idx,
+        #  selected_logprobs_idx) = _get_sampled_logprob_if_needed(
+        #      seq_group, sample_result, selected_logprobs, ranks, top_token_ids,
+        #      top_logprobs, selected_logprobs_idx, top_logprob_idx)
+        # sample_logprobs_per_seq_group.append(sampled_logprobs)
+        sample_logprobs_per_seq_group.append([{}])
 
-    return _build_sampler_output(sample_results,
+    sampler_output = _build_sampler_output(sample_results,
         sampling_metadata,
         prompt_logprobs_per_seq_group,
         sample_logprobs_per_seq_group,
-        on_device_tensors=on_device_tensors)
+        on_device_tensors=on_device_tensors,
+        top_token_ids=top_token_ids)
+    return sampler_output
 
 def _get_prompt_logprob_if_needed(
     seq_group: SequenceGroupToSample,
@@ -1021,6 +1035,7 @@ def _build_sampler_output(
     sample_logprobs: List[SampleLogprobs],
     on_device_tensors: Optional[Tuple[torch.Tensor, torch.Tensor,
                                       torch.Tensor]],
+    top_token_ids: Optional[torch.Tensor],
 ) -> SamplerOutput:
     """Construct Python objects with the output of sampling.
 
@@ -1033,18 +1048,18 @@ def _build_sampler_output(
 
     sampler_output = []
     for (seq_group, sample_result, group_prompt_logprobs,
-         group_sample_logprobs) in zip(sampling_metadata.seq_groups,
+         group_sample_logprobs, next_token_ids) in zip(sampling_metadata.seq_groups,
                                        sample_results, prompt_logprobs,
-                                       sample_logprobs):
+                                       sample_logprobs, top_token_ids):
         seq_ids = seq_group.seq_ids
-        next_token_ids, parent_ids = sample_result
+        _, parent_ids = sample_result
         seq_outputs = []
         for parent_id, next_token_id, logprobs in zip(parent_ids,
                                                       next_token_ids,
                                                       group_sample_logprobs):
-            assert torch.is_tensor(next_token_id) == False
+            #assert torch.is_tensor(next_token_id) == False
             seq_outputs.append(
-                SequenceOutput(seq_ids[parent_id], next_token_id, logprobs))
+                SequenceOutput(seq_ids[parent_id], next_token_id.item(), logprobs))
         sampler_output.append(
             SequenceGroupOutput(seq_outputs, group_prompt_logprobs))
 

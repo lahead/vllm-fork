@@ -257,7 +257,7 @@ class EngineArgs:
                             action='store_true',
                             help='Enables automatic prefix caching.')
         parser.add_argument('--use-v2-block-manager',
-                            action='store_true',
+                            action='store_false',
                             help='Use BlockSpaceMangerV2.')
         parser.add_argument(
             '--num-lookahead-slots',
